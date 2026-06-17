@@ -14,7 +14,9 @@
 
 	<groupId>com.googlecode.objectify</groupId>
 	<artifactId>objectify</artifactId>
-	<version>6.1.4-SNAPSHOT</version>
+	<!-- Streak fork: upstream master (PR #527, Valkey cache) stamped as a fixed
+	     version for the mailfoogae Artifact Registry. Bump -streak-valkey-N for hotfixes. -->
+	<version>6.1.4-streak-valkey-1</version>
 
 	<name>Objectify App Engine</name>
 	<description>The simplest convenient interface to the Google App Engine datastore</description>
@@ -40,14 +42,10 @@
 	</developers>
 
 	<distributionManagement>
-		<snapshotRepository>
-			<id>ossrh</id>
-			<url>https://oss.sonatype.org/content/repositories/snapshots</url>
-		</snapshotRepository>
 		<repository>
-			<id>ossrh</id>
-			<name>Nexus Release Repository</name>
-			<url>https://oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+			<id>artifact-registry</id>
+			<name>Streak Artifact Registry</name>
+			<url>artifactregistry://us-central1-maven.pkg.dev/mailfoogae/streak-maven</url>
 		</repository>
 	</distributionManagement>
 
@@ -81,6 +79,15 @@
 	</profiles>
 
 	<build>
+		<extensions>
+			<!-- Lets Maven deploy to artifactregistry:// URLs, authenticating via
+			     gcloud Application Default Credentials. -->
+			<extension>
+				<groupId>com.google.cloud.artifactregistry</groupId>
+				<artifactId>artifactregistry-maven-wagon</artifactId>
+				<version>2.2.5</version>
+			</extension>
+		</extensions>
 		<plugins>
 			<plugin>
 				<artifactId>maven-compiler-plugin</artifactId>
@@ -127,19 +134,7 @@
 				<version>3.1.2</version>
 			</plugin>
 
-			<plugin>
-				<groupId>org.sonatype.plugins</groupId>
-				<artifactId>nexus-staging-maven-plugin</artifactId>
-				<version>1.6.13</version>
-				<extensions>true</extensions>
-				<configuration>
-					<serverId>ossrh</serverId>
-					<nexusUrl>https://oss.sonatype.org/</nexusUrl>
-					<autoReleaseAfterClose>true</autoReleaseAfterClose>
-				</configuration>
-			</plugin>
-
-			<plugin>
+<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-release-plugin</artifactId>
 				<version>3.0.1</version>
