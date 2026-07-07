@@ -81,6 +81,16 @@ public class ValkeyCacheService implements MemcacheService {
 	/** Fallback TTL (seconds) for writes that don't specify their own; keeps the keyspace bounded. */
 	private final int defaultExpirationSeconds;
 
+	/**
+	 * SET options that expire the key after {@link #defaultExpirationSeconds}. {@link SetOptions} is immutable and
+	 * thread-safe once built, so we pre-build one instance instead of allocating a new builder on every
+	 * {@link #put}/{@link #putAll} — both hot paths for a cache service.
+	 */
+	private final SetOptions defaultSetOptions;
+
+	/** Cold-cache sentinel options: {@code NX} plus the default TTL. Pre-built for the same reason as {@link #defaultSetOptions}. */
+	private final SetOptions defaultNxSetOptions;
+
 	/** Uses {@link #DEFAULT_EXPIRATION_SECONDS} as the fallback TTL. */
 	public ValkeyCacheService(final BaseClient client) {
 		this(client, DEFAULT_EXPIRATION_SECONDS);
@@ -92,11 +102,13 @@ public class ValkeyCacheService implements MemcacheService {
 		}
 		this.client = client;
 		this.defaultExpirationSeconds = defaultExpirationSeconds;
-	}
-
-	/** SET options that expire the key after {@link #defaultExpirationSeconds}. */
-	private SetOptions withDefaultTtl() {
-		return SetOptions.builder().expiry(SetOptions.Expiry.Seconds((long) defaultExpirationSeconds)).build();
+		this.defaultSetOptions = SetOptions.builder()
+				.expiry(SetOptions.Expiry.Seconds((long) defaultExpirationSeconds))
+				.build();
+		this.defaultNxSetOptions = SetOptions.builder()
+				.conditionalSet(ConditionalSet.ONLY_IF_DOES_NOT_EXIST)
+				.expiry(SetOptions.Expiry.Seconds((long) defaultExpirationSeconds))
+				.build();
 	}
 
 	private static byte[] toCacheBytes(final Object thing) {
@@ -167,13 +179,9 @@ public class ValkeyCacheService implements MemcacheService {
 
 		// Cold cache: bootstrap a sentinel under NX so we can later CAS against it. NX prevents
 		// us from clobbering a value another caller has just set in between our GET and our SET.
-		// TTL-bounded like every other write: a read-heavy workload bootstraps a sentinel per
-		// cold key, and without expiry those persist forever on a noeviction cluster.
-		final SetOptions nx = SetOptions.builder()
-				.conditionalSet(ConditionalSet.ONLY_IF_DOES_NOT_EXIST)
-				.expiry(SetOptions.Expiry.Seconds((long) defaultExpirationSeconds))
-				.build();
-		await(client.set(gskey(key), gs(NULL_VALUE), nx));
+		// TTL-bounded like every other write (defaultNxSetOptions): a read-heavy workload bootstraps
+		// a sentinel per cold key, and without expiry those persist forever on a noeviction cluster.
+		await(client.set(gskey(key), gs(NULL_VALUE), defaultNxSetOptions));
 
 		final byte[] bootstrapped = rawGet(key);
 		return bootstrapped == null ? null : new ValkeyIdentifiableValue(fromCacheBytes(bootstrapped), bootstrapped);
@@ -202,7 +210,7 @@ public class ValkeyCacheService implements MemcacheService {
 
 	@Override
 	public void put(final String key, final Object thing) {
-		await(client.set(gskey(key), gs(toCacheBytes(thing)), withDefaultTtl()));
+		await(client.set(gskey(key), gs(toCacheBytes(thing)), defaultSetOptions));
 	}
 
 	@Override
@@ -212,7 +220,7 @@ public class ValkeyCacheService implements MemcacheService {
 		}
 		// Per-key SETs fired concurrently (no MSET, which would CROSSSLOT on a cluster).
 		final List<CompletableFuture<String>> futures = new ArrayList<>();
-		values.forEach((key, value) -> futures.add(client.set(gskey(key), gs(toCacheBytes(value)), withDefaultTtl())));
+		values.forEach((key, value) -> futures.add(client.set(gskey(key), gs(toCacheBytes(value)), defaultSetOptions)));
 		futures.forEach(ValkeyCacheService::await);
 	}
 
