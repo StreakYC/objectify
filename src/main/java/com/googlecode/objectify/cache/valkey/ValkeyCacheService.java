@@ -11,7 +11,6 @@ import glide.api.models.commands.SetOptions.ConditionalSet;
 import glide.api.models.configuration.RequestRoutingConfiguration.Route;
 import glide.api.models.configuration.RequestRoutingConfiguration.SlotKeyRoute;
 import glide.api.models.configuration.RequestRoutingConfiguration.SlotType;
-import lombok.RequiredArgsConstructor;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -53,8 +52,15 @@ import static glide.api.models.GlideString.gs;
  *
  * <p>Null values are stored as a single {@code 0x00} byte. Java-serialized objects always begin
  * with the magic bytes {@code 0xAC 0xED}, so the sentinel can never collide with a real value.</p>
+ *
+ * <p><b>Expiration.</b> Every write carries a TTL so the keyspace stays bounded. Memcache-backed
+ * caches shed cold entries via LRU eviction; a Valkey cluster configured with {@code noeviction}
+ * cannot, so a persistent write pattern grows until {@code maxmemory} is hit and every subsequent
+ * write (including unrelated callers sharing the cluster) fails with {@code OOM}. Entities that
+ * declare their own expiration keep it; everything else — plain {@link #put}/{@link #putAll}
+ * writes, the cold-cache null sentinel, and CAS writes with no explicit TTL — falls back to
+ * {@code defaultExpirationSeconds}.</p>
  */
-@RequiredArgsConstructor
 public class ValkeyCacheService implements MemcacheService {
 
 	/** Single-byte sentinel for null. Cannot collide with Java-serialized data (which starts 0xAC 0xED). */
@@ -63,11 +69,35 @@ public class ValkeyCacheService implements MemcacheService {
 	/** "OK" reply from Valkey when a write succeeds. */
 	private static final String OK = "OK";
 
+	/** Default TTL applied to writes without an explicit expiration: 24 hours, matching Streak's other Valkey object caches. */
+	public static final int DEFAULT_EXPIRATION_SECONDS = 86_400;
+
 	/**
 	 * BaseClient so this works with either the standalone (GlideClient) or cluster
 	 * (GlideClusterClient) valkey client; every operation is single-key or key-routed.
 	 */
 	private final BaseClient client;
+
+	/** Fallback TTL (seconds) for writes that don't specify their own; keeps the keyspace bounded. */
+	private final int defaultExpirationSeconds;
+
+	/** Uses {@link #DEFAULT_EXPIRATION_SECONDS} as the fallback TTL. */
+	public ValkeyCacheService(final BaseClient client) {
+		this(client, DEFAULT_EXPIRATION_SECONDS);
+	}
+
+	public ValkeyCacheService(final BaseClient client, final int defaultExpirationSeconds) {
+		if (defaultExpirationSeconds <= 0) {
+			throw new IllegalArgumentException("defaultExpirationSeconds must be positive, got " + defaultExpirationSeconds);
+		}
+		this.client = client;
+		this.defaultExpirationSeconds = defaultExpirationSeconds;
+	}
+
+	/** SET options that expire the key after {@link #defaultExpirationSeconds}. */
+	private SetOptions withDefaultTtl() {
+		return SetOptions.builder().expiry(SetOptions.Expiry.Seconds((long) defaultExpirationSeconds)).build();
+	}
 
 	private static byte[] toCacheBytes(final Object thing) {
 		if (thing == null) {
@@ -137,8 +167,11 @@ public class ValkeyCacheService implements MemcacheService {
 
 		// Cold cache: bootstrap a sentinel under NX so we can later CAS against it. NX prevents
 		// us from clobbering a value another caller has just set in between our GET and our SET.
+		// TTL-bounded like every other write: a read-heavy workload bootstraps a sentinel per
+		// cold key, and without expiry those persist forever on a noeviction cluster.
 		final SetOptions nx = SetOptions.builder()
 				.conditionalSet(ConditionalSet.ONLY_IF_DOES_NOT_EXIST)
+				.expiry(SetOptions.Expiry.Seconds((long) defaultExpirationSeconds))
 				.build();
 		await(client.set(gskey(key), gs(NULL_VALUE), nx));
 
@@ -169,7 +202,7 @@ public class ValkeyCacheService implements MemcacheService {
 
 	@Override
 	public void put(final String key, final Object thing) {
-		await(client.set(gskey(key), gs(toCacheBytes(thing))));
+		await(client.set(gskey(key), gs(toCacheBytes(thing)), withDefaultTtl()));
 	}
 
 	@Override
@@ -179,7 +212,7 @@ public class ValkeyCacheService implements MemcacheService {
 		}
 		// Per-key SETs fired concurrently (no MSET, which would CROSSSLOT on a cluster).
 		final List<CompletableFuture<String>> futures = new ArrayList<>();
-		values.forEach((key, value) -> futures.add(client.set(gskey(key), gs(toCacheBytes(value)))));
+		values.forEach((key, value) -> futures.add(client.set(gskey(key), gs(toCacheBytes(value)), withDefaultTtl())));
 		futures.forEach(ValkeyCacheService::await);
 	}
 
@@ -200,16 +233,15 @@ public class ValkeyCacheService implements MemcacheService {
 
 			final GlideString expected = gs(viv.getRawBytes());
 			final GlideString next = gs(toCacheBytes(casPut.getNextToStore()));
-			final int ttl = casPut.getExpirationSeconds();
+			// Honor an entity's own expiration; otherwise fall back to the default TTL so CAS writes
+			// stay bounded like plain puts (0 previously meant "never expire").
+			final int explicitTtl = casPut.getExpirationSeconds();
+			final int ttl = explicitTtl > 0 ? explicitTtl : defaultExpirationSeconds;
 
-			final GlideString[] args = ttl > 0
-					? new GlideString[]{
-							gs("SET"), gskey(key), next,
-							gs("IFEQ"), expected,
-							gs("EX"), gs(Integer.toString(ttl))}
-					: new GlideString[]{
-							gs("SET"), gskey(key), next,
-							gs("IFEQ"), expected};
+			final GlideString[] args = new GlideString[]{
+					gs("SET"), gskey(key), next,
+					gs("IFEQ"), expected,
+					gs("EX"), gs(Integer.toString(ttl))};
 
 			futures.put(key, casAsync(key, args));
 		}
