@@ -161,7 +161,7 @@ public class ValkeyCacheService implements MemcacheService {
 		// The first byte identifies the encoding (see the class javadoc). A FORMAT_DEFLATE marker means the
 		// remainder is a compressed stream; anything else is a bare Java serialization — including every
 		// entry written before compression existed — so old and new values both read back correctly.
-		final byte[] serialized = bytes[0] == FORMAT_DEFLATE
+		final byte[] serialized = (bytes.length > 0 && bytes[0] == FORMAT_DEFLATE)
 				? inflate(bytes, 1, bytes.length - 1)
 				: bytes;
 		return deserialize(serialized);
@@ -190,9 +190,9 @@ public class ValkeyCacheService implements MemcacheService {
 	/** Deflates {@code data}, prefixing the {@link #FORMAT_DEFLATE} marker so reads can spot the encoding. */
 	private static byte[] deflate(final byte[] data) {
 		final Deflater deflater = new Deflater(Deflater.DEFAULT_COMPRESSION);
-		deflater.setInput(data);
-		deflater.finish();
 		try {
+			deflater.setInput(data);
+			deflater.finish();
 			// Compressed output is normally well under the input size; the marker byte rides along in front.
 			final ByteArrayOutputStream baos = new ByteArrayOutputStream(Math.max(64, data.length / 3));
 			baos.write(FORMAT_DEFLATE);
@@ -210,8 +210,8 @@ public class ValkeyCacheService implements MemcacheService {
 	/** Inflates the {@code length} bytes at {@code offset} (the payload after the {@link #FORMAT_DEFLATE} marker). */
 	private static byte[] inflate(final byte[] data, final int offset, final int length) {
 		final Inflater inflater = new Inflater();
-		inflater.setInput(data, offset, length);
 		try {
+			inflater.setInput(data, offset, length);
 			final ByteArrayOutputStream baos = new ByteArrayOutputStream(Math.max(64, length * 3));
 			final byte[] buffer = new byte[8192];
 			while (!inflater.finished()) {

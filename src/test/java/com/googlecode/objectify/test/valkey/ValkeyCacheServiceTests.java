@@ -331,6 +331,20 @@ class ValkeyCacheServiceTests {
 		assertThat(cache.get("legacy-big")).isEqualTo(big);
 	}
 
+	@Test
+	void readsEmptyStoredValueAsCorruptRatherThanIndexError() throws Exception {
+		// A zero-length value can't come from our own writes, but an external writer could leave one.
+		// It must not trip an ArrayIndexOutOfBoundsException on the format-byte check; it falls through
+		// to deserialization, which wraps the failure descriptively.
+		writeRaw("empty", new byte[0]);
+		try {
+			cache.get("empty");
+			throw new AssertionError("expected a wrapped deserialization failure");
+		} catch (final RuntimeException expected) {
+			assertThat(expected).isNotInstanceOf(ArrayIndexOutOfBoundsException.class);
+		}
+	}
+
 	private static byte[] rawBytes(final String key) throws Exception {
 		final GlideString value = client.get(GlideString.gs(key.getBytes(StandardCharsets.UTF_8))).get();
 		return value == null ? null : value.getBytes();
