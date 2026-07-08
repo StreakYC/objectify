@@ -6,6 +6,7 @@ import com.googlecode.objectify.cache.MemcacheService.CasPut;
 import com.googlecode.objectify.cache.valkey.ValkeyCacheService;
 import com.googlecode.objectify.cache.valkey.ValkeyIdentifiableValue;
 import glide.api.GlideClient;
+import glide.api.models.GlideString;
 import glide.api.models.configuration.GlideClientConfiguration;
 import glide.api.models.configuration.NodeAddress;
 import org.junit.jupiter.api.AfterAll;
@@ -15,7 +16,10 @@ import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.utility.DockerImageName;
 
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectOutputStream;
 import java.io.Serializable;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -283,6 +287,71 @@ class ValkeyCacheServiceTests {
 		assertThat(wins.get()).isEqualTo(1);
 		assertThat(cache.get(key)).isInstanceOf(String.class);
 		assertThat((String) cache.get(key)).startsWith("writer-");
+	}
+
+	@Test
+	void largeValueRoundTripsThroughCompression() throws Exception {
+		final String big = repeat('x', 200_000);
+		cache.put("big", big);
+
+		// Round-trips intact...
+		assertThat(cache.get("big")).isEqualTo(big);
+
+		// ...and was actually stored compressed: the deflate marker leads, and the stored form is far
+		// smaller than the raw serialization.
+		final byte[] stored = rawBytes("big");
+		assertThat(stored[0] & 0xFF).isEqualTo(0x01);
+		assertThat(stored.length).isLessThan(javaSerialize(big).length);
+	}
+
+	@Test
+	void smallValueIsStoredUncompressed() throws Exception {
+		cache.put("small", new Sample("hello", 42));
+
+		// Below the threshold we skip compression, so the stored bytes are a bare Java serialization
+		// (stream magic 0xAC), not a compressed payload.
+		final byte[] stored = rawBytes("small");
+		assertThat(stored[0] & 0xFF).isEqualTo(0xAC);
+	}
+
+	@Test
+	void readsLegacyUncompressedValueWrittenBeforeCompression() throws Exception {
+		// An entry written by the pre-compression code is a raw Java serialization with no marker byte.
+		final Sample value = new Sample("legacy", 7);
+		writeRaw("legacy", javaSerialize(value));
+		assertThat(cache.get("legacy")).isEqualTo(value);
+	}
+
+	@Test
+	void readsLegacyLargeUncompressedValue() throws Exception {
+		// A large entry written before compression existed is stored uncompressed; the read path must not
+		// assume "large implies compressed", so this must deserialize directly rather than try to inflate.
+		final String big = repeat('y', 200_000);
+		writeRaw("legacy-big", javaSerialize(big));
+		assertThat(cache.get("legacy-big")).isEqualTo(big);
+	}
+
+	private static byte[] rawBytes(final String key) throws Exception {
+		final GlideString value = client.get(GlideString.gs(key.getBytes(StandardCharsets.UTF_8))).get();
+		return value == null ? null : value.getBytes();
+	}
+
+	private static void writeRaw(final String key, final byte[] bytes) throws Exception {
+		client.set(GlideString.gs(key.getBytes(StandardCharsets.UTF_8)), GlideString.gs(bytes)).get();
+	}
+
+	private static byte[] javaSerialize(final Object thing) throws Exception {
+		final ByteArrayOutputStream baos = new ByteArrayOutputStream();
+		try (final ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+			oos.writeObject(thing);
+		}
+		return baos.toByteArray();
+	}
+
+	private static String repeat(final char c, final int n) {
+		final char[] chars = new char[n];
+		Arrays.fill(chars, c);
+		return new String(chars);
 	}
 
 	private static class Sample implements Serializable {

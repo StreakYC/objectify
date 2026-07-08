@@ -28,6 +28,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.zip.DataFormatException;
+import java.util.zip.Deflater;
+import java.util.zip.Inflater;
 
 import static glide.api.models.GlideString.gs;
 
@@ -50,8 +53,20 @@ import static glide.api.models.GlideString.gs;
  * then re-reads the key. The bootstrap value is what subsequent {@link #putIfUntouched} calls
  * compare against, mirroring the {@code add}-then-{@code gets} pattern used for memcached.</p>
  *
- * <p>Null values are stored as a single {@code 0x00} byte. Java-serialized objects always begin
- * with the magic bytes {@code 0xAC 0xED}, so the sentinel can never collide with a real value.</p>
+ * <p><b>Wire format.</b> The first byte of every stored value identifies its encoding, and the three
+ * possibilities can never collide:
+ * <ul>
+ *   <li>{@code 0x00} — the null sentinel (a single byte; memcache couldn't store nulls either).</li>
+ *   <li>{@code 0xAC} — an uncompressed Java-serialized object (the serialization stream magic is
+ *       {@code 0xAC 0xED}).</li>
+ *   <li>{@code 0x01} — a Deflate-compressed Java-serialized object; the compressed stream follows
+ *       the marker byte.</li>
+ * </ul>
+ * Values are compressed only when their serialized form reaches {@link #COMPRESSION_THRESHOLD_BYTES}
+ * (small values don't benefit and would just burn CPU on the write path), mirroring the &gt;16&nbsp;KB
+ * compression the spymemcached transcoder applied on the old memcache path. Reads accept either form,
+ * so the cache stays readable across the rollout and after a downgrade — entries written before this
+ * change, and any below the threshold, are plain uncompressed serializations.</p>
  *
  * <p><b>Expiration.</b> Every write carries a TTL so the keyspace stays bounded. Memcache-backed
  * caches shed cold entries via LRU eviction; a Valkey cluster configured with {@code noeviction}
@@ -65,6 +80,20 @@ public class ValkeyCacheService implements MemcacheService {
 
 	/** Single-byte sentinel for null. Cannot collide with Java-serialized data (which starts 0xAC 0xED). */
 	private static final byte[] NULL_VALUE = new byte[]{0};
+
+	/**
+	 * Marker byte prefixing a Deflate-compressed payload. Distinct from the null sentinel ({@code 0x00})
+	 * and from the {@code 0xAC} that opens every Java serialization stream, so {@link #fromCacheBytes}
+	 * can tell the three encodings apart from the first byte alone.
+	 */
+	private static final byte FORMAT_DEFLATE = 0x01;
+
+	/**
+	 * Serialized values at least this large are Deflate-compressed before storage; smaller ones are
+	 * stored as-is. 16&nbsp;KB matches the threshold spymemcached's default transcoder used on the old
+	 * memcache path — small values compress poorly and aren't worth the CPU on the request hot path.
+	 */
+	public static final int COMPRESSION_THRESHOLD_BYTES = 16_384;
 
 	/** "OK" reply from Valkey when a write succeeds. */
 	private static final String OK = "OK";
@@ -115,6 +144,30 @@ public class ValkeyCacheService implements MemcacheService {
 		if (thing == null) {
 			return NULL_VALUE;
 		}
+		final byte[] serialized = serialize(thing);
+		// Compress only above the threshold: below it Deflate rarely pays for itself (and can even grow
+		// tiny payloads) while still costing CPU on the write hot path. Above it, compression is what
+		// keeps large entities from filling the cluster and driving the LRU eviction we're trying to slow.
+		if (serialized.length < COMPRESSION_THRESHOLD_BYTES) {
+			return serialized;
+		}
+		return deflate(serialized);
+	}
+
+	private static Object fromCacheBytes(final byte[] bytes) {
+		if (bytes == null || Arrays.equals(bytes, NULL_VALUE)) {
+			return null;
+		}
+		// The first byte identifies the encoding (see the class javadoc). A FORMAT_DEFLATE marker means the
+		// remainder is a compressed stream; anything else is a bare Java serialization — including every
+		// entry written before compression existed — so old and new values both read back correctly.
+		final byte[] serialized = bytes[0] == FORMAT_DEFLATE
+				? inflate(bytes, 1, bytes.length - 1)
+				: bytes;
+		return deserialize(serialized);
+	}
+
+	private static byte[] serialize(final Object thing) {
 		try (final ByteArrayOutputStream baos = new ByteArrayOutputStream();
 			 final ObjectOutputStream oos = new ObjectOutputStream(baos)) {
 			oos.writeObject(thing);
@@ -125,15 +178,54 @@ public class ValkeyCacheService implements MemcacheService {
 		}
 	}
 
-	private static Object fromCacheBytes(final byte[] bytes) {
-		if (bytes == null || Arrays.equals(bytes, NULL_VALUE)) {
-			return null;
-		}
-		try (final ByteArrayInputStream bais = new ByteArrayInputStream(bytes);
+	private static Object deserialize(final byte[] serialized) {
+		try (final ByteArrayInputStream bais = new ByteArrayInputStream(serialized);
 			 final ObjectInputStream ois = new ObjectInputStream(bais)) {
 			return ois.readObject();
 		} catch (final IOException | ClassNotFoundException e) {
 			throw new RuntimeException("Failed to deserialize cache value", e);
+		}
+	}
+
+	/** Deflates {@code data}, prefixing the {@link #FORMAT_DEFLATE} marker so reads can spot the encoding. */
+	private static byte[] deflate(final byte[] data) {
+		final Deflater deflater = new Deflater(Deflater.DEFAULT_COMPRESSION);
+		deflater.setInput(data);
+		deflater.finish();
+		try {
+			// Compressed output is normally well under the input size; the marker byte rides along in front.
+			final ByteArrayOutputStream baos = new ByteArrayOutputStream(Math.max(64, data.length / 3));
+			baos.write(FORMAT_DEFLATE);
+			final byte[] buffer = new byte[8192];
+			while (!deflater.finished()) {
+				final int n = deflater.deflate(buffer);
+				baos.write(buffer, 0, n);
+			}
+			return baos.toByteArray();
+		} finally {
+			deflater.end();
+		}
+	}
+
+	/** Inflates the {@code length} bytes at {@code offset} (the payload after the {@link #FORMAT_DEFLATE} marker). */
+	private static byte[] inflate(final byte[] data, final int offset, final int length) {
+		final Inflater inflater = new Inflater();
+		inflater.setInput(data, offset, length);
+		try {
+			final ByteArrayOutputStream baos = new ByteArrayOutputStream(Math.max(64, length * 3));
+			final byte[] buffer = new byte[8192];
+			while (!inflater.finished()) {
+				final int n = inflater.inflate(buffer);
+				if (n == 0 && (inflater.needsInput() || inflater.needsDictionary())) {
+					throw new IllegalStateException("Corrupt or truncated compressed cache value");
+				}
+				baos.write(buffer, 0, n);
+			}
+			return baos.toByteArray();
+		} catch (final DataFormatException e) {
+			throw new RuntimeException("Failed to decompress cache value", e);
+		} finally {
+			inflater.end();
 		}
 	}
 
