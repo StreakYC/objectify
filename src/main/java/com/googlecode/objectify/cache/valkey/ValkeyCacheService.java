@@ -63,10 +63,12 @@ import static glide.api.models.GlideString.gs;
  *       the marker byte.</li>
  * </ul>
  * Values are compressed only when their serialized form reaches {@link #COMPRESSION_THRESHOLD_BYTES}
- * (small values don't benefit and would just burn CPU on the write path), mirroring the &gt;16&nbsp;KB
- * compression the spymemcached transcoder applied on the old memcache path. Reads accept either form,
- * so the cache stays readable across the rollout and after a downgrade — entries written before this
- * change, and any below the threshold, are plain uncompressed serializations.</p>
+ * (tiny values don't benefit and would just burn CPU on the write path). The old memcache path
+ * compressed only above ~16&nbsp;KB (spymemcached's default); this threshold is deliberately lower so
+ * more of the keyspace is compressed, trading a little CPU on mid-size values for less memory on a
+ * cluster that runs memory-bound and evicts hard. Reads accept either form, so the cache stays
+ * readable across the rollout and after a downgrade — entries written before this change, and any
+ * below the threshold, are plain uncompressed serializations.</p>
  *
  * <p><b>Expiration.</b> Every write carries a TTL so the keyspace stays bounded. Memcache-backed
  * caches shed cold entries via LRU eviction; a Valkey cluster configured with {@code noeviction}
@@ -90,10 +92,11 @@ public class ValkeyCacheService implements MemcacheService {
 
 	/**
 	 * Serialized values at least this large are Deflate-compressed before storage; smaller ones are
-	 * stored as-is. 16&nbsp;KB matches the threshold spymemcached's default transcoder used on the old
-	 * memcache path — small values compress poorly and aren't worth the CPU on the request hot path.
+	 * stored as-is. Set to 2&nbsp;KB — well below the ~16&nbsp;KB spymemcached's default transcoder used —
+	 * to compress a larger share of the keyspace and relieve Valkey memory pressure; values under a couple
+	 * KB compress poorly and aren't worth the CPU on the request hot path.
 	 */
-	public static final int COMPRESSION_THRESHOLD_BYTES = 16_384;
+	public static final int COMPRESSION_THRESHOLD_BYTES = 2_048;
 
 	/** "OK" reply from Valkey when a write succeeds. */
 	private static final String OK = "OK";

@@ -315,6 +315,19 @@ class ValkeyCacheServiceTests {
 	}
 
 	@Test
+	void midSizeValueAboveThresholdIsCompressed() throws Exception {
+		// ~4 KB serialized: below the old 16 KB memcache cutoff but above the current 2 KB threshold,
+		// so it must now be compressed. Guards the lowered threshold against silently regressing to 16 KB.
+		final String mid = repeat('z', 4_000);
+		assertThat(javaSerialize(mid).length).isGreaterThan(ValkeyCacheService.COMPRESSION_THRESHOLD_BYTES);
+		cache.put("mid", mid);
+
+		assertThat(cache.get("mid")).isEqualTo(mid);
+		final byte[] stored = rawBytes("mid");
+		assertThat(stored[0] & 0xFF).isEqualTo(0x01);
+	}
+
+	@Test
 	void readsLegacyUncompressedValueWrittenBeforeCompression() throws Exception {
 		// An entry written by the pre-compression code is a raw Java serialization with no marker byte.
 		final Sample value = new Sample("legacy", 7);
