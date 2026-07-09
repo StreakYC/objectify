@@ -17,7 +17,10 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.utility.DockerImageName;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.ObjectStreamClass;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -358,6 +361,41 @@ class ValkeyCacheServiceTests {
 		}
 	}
 
+	@Test
+	void injectedFactoryRemapsClassNamesOnRead() {
+		// Simulates the shaded/un-relocated split that produces "ClassNotFoundException:
+		// streak.com.google.common..." in prod: a value serialized under one class name is read back by a
+		// process that only has the class under a different name. A ValkeyCacheService built with a custom
+		// ObjectInputStreamFactory that swaps the class descriptor must decode it — which is exactly how
+		// Streak's KeySubstitutingObjectInputStream reads cache entries written by a differently-relocated
+		// peer. The swap is done in readClassDescriptor(), not resolveClass(): since JDK 17 the latter
+		// rejects a class whose name differs from the stream descriptor with InvalidClassException.
+		final String writtenName = Alpha.class.getName();
+		final MemcacheService remapping = new ValkeyCacheService(client, in -> new ObjectInputStream(in) {
+			@Override
+			protected ObjectStreamClass readClassDescriptor() throws IOException, ClassNotFoundException {
+				final ObjectStreamClass desc = super.readClassDescriptor();
+				return desc.getName().equals(writtenName) ? ObjectStreamClass.lookup(Beta.class) : desc;
+			}
+		});
+
+		remapping.put("k", new Alpha("payload"));
+		final Object read = remapping.get("k");
+
+		assertThat(read).isInstanceOf(Beta.class);
+		assertThat(((Beta) read).s).isEqualTo("payload");
+	}
+
+	@Test
+	void factoryConstructorRoundTripsAndAppliesDefaultTtl() throws Exception {
+		// The (client, ttl, factory) constructor honors both the TTL and a plain-delegating factory.
+		final MemcacheService withFactory =
+				new ValkeyCacheService(client, 100, ObjectInputStream::new);
+		withFactory.put("k", new Alpha("v"));
+		assertThat(((Alpha) withFactory.get("k")).s).isEqualTo("v");
+		assertThat(ttlOf("k")).isGreaterThan(0L);
+	}
+
 	private static byte[] rawBytes(final String key) throws Exception {
 		final GlideString value = client.get(GlideString.gs(key.getBytes(StandardCharsets.UTF_8))).get();
 		return value == null ? null : value.getBytes();
@@ -379,6 +417,29 @@ class ValkeyCacheServiceTests {
 		final char[] chars = new char[n];
 		Arrays.fill(chars, c);
 		return new String(chars);
+	}
+
+	/**
+	 * {@link Alpha} and {@link Beta} share an identical serial layout and {@code serialVersionUID}, so a
+	 * stream written as {@code Alpha} deserializes into {@code Beta} once {@code resolveClass} maps the
+	 * name — the same compatibility the shaded/un-relocated Guava class pairs rely on.
+	 */
+	private static class Alpha implements Serializable {
+		private static final long serialVersionUID = 99L;
+		private final String s;
+
+		Alpha(final String s) {
+			this.s = s;
+		}
+	}
+
+	private static class Beta implements Serializable {
+		private static final long serialVersionUID = 99L;
+		private final String s;
+
+		Beta(final String s) {
+			this.s = s;
+		}
 	}
 
 	private static class Sample implements Serializable {
