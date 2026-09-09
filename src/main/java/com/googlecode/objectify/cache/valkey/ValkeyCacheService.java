@@ -292,26 +292,58 @@ public class ValkeyCacheService implements MemcacheService {
 	@Override
 	public Map<String, IdentifiableValue> getIdentifiables(final Collection<String> keys) {
 		final Map<String, IdentifiableValue> result = new LinkedHashMap<>();
+		if (keys.isEmpty()) {
+			return result;
+		}
+
+		// Per-key GETs fired concurrently (no MGET, which would CROSSSLOT on a cluster). Awaiting
+		// each GET before issuing the next would make a batch cost one serial round trip per key,
+		// which is what Objectify's entity-load path does on every batch read.
+		final Map<String, CompletableFuture<GlideString>> gets = new LinkedHashMap<>();
 		for (final String key : keys) {
-			result.put(key, getIdentifiable(key));
+			gets.put(key, client.get(gskey(key)));
 		}
+
+		final Map<String, byte[]> raw = new LinkedHashMap<>();
+		gets.forEach((key, future) -> {
+			final GlideString value = await(future);
+			raw.put(key, value == null ? null : value.getBytes());
+		});
+
+		final List<String> cold = new ArrayList<>();
+		raw.forEach((key, bytes) -> {
+			if (bytes == null) {
+				cold.add(key);
+			}
+		});
+
+		if (!cold.isEmpty()) {
+			// Cold cache: bootstrap a sentinel under NX so we can later CAS against it. NX prevents
+			// us from clobbering a value another caller has just set in between our GET and our SET.
+			// TTL-bounded like every other write (defaultNxSetOptions): a read-heavy workload bootstraps
+			// a sentinel per cold key, and without expiry those persist forever on a noeviction cluster.
+			final List<CompletableFuture<String>> bootstraps = new ArrayList<>();
+			for (final String key : cold) {
+				bootstraps.add(client.set(gskey(key), gs(NULL_VALUE), defaultNxSetOptions));
+			}
+			bootstraps.forEach(ValkeyCacheService::await);
+
+			final Map<String, CompletableFuture<GlideString>> rereads = new LinkedHashMap<>();
+			for (final String key : cold) {
+				rereads.put(key, client.get(gskey(key)));
+			}
+			rereads.forEach((key, future) -> {
+				final GlideString value = await(future);
+				raw.put(key, value == null ? null : value.getBytes());
+			});
+		}
+
+		raw.forEach((key, bytes) -> {
+			if (bytes != null) {
+				result.put(key, new ValkeyIdentifiableValue(fromCacheBytes(bytes), bytes));
+			}
+		});
 		return result;
-	}
-
-	private IdentifiableValue getIdentifiable(final String key) {
-		final byte[] bytes = rawGet(key);
-		if (bytes != null) {
-			return new ValkeyIdentifiableValue(fromCacheBytes(bytes), bytes);
-		}
-
-		// Cold cache: bootstrap a sentinel under NX so we can later CAS against it. NX prevents
-		// us from clobbering a value another caller has just set in between our GET and our SET.
-		// TTL-bounded like every other write (defaultNxSetOptions): a read-heavy workload bootstraps
-		// a sentinel per cold key, and without expiry those persist forever on a noeviction cluster.
-		await(client.set(gskey(key), gs(NULL_VALUE), defaultNxSetOptions));
-
-		final byte[] bootstrapped = rawGet(key);
-		return bootstrapped == null ? null : new ValkeyIdentifiableValue(fromCacheBytes(bootstrapped), bootstrapped);
 	}
 
 	@Override

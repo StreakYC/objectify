@@ -16,7 +16,7 @@
 	<artifactId>objectify</artifactId>
 	<!-- Streak fork: upstream master (PR #527, Valkey cache) stamped as a fixed
 	     version for the mailfoogae Artifact Registry. Bump -streak-valkey-N for hotfixes. -->
-	<version>6.1.4-streak-valkey-8</version>
+	<version>6.1.4-streak-valkey-9</version>
 
 	<name>Objectify App Engine</name>
 	<description>The simplest convenient interface to the Google App Engine datastore</description>

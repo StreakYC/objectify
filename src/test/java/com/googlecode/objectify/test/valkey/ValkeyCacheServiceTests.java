@@ -132,6 +132,35 @@ class ValkeyCacheServiceTests {
 	}
 
 	@Test
+	void getIdentifiablesMixesWarmAndColdKeysInOneBatch() {
+		cache.put("warm", "alpha");
+
+		final Map<String, IdentifiableValue> ivs = cache.getIdentifiables(Arrays.asList("warm", "cold", "warm2"));
+		cache.put("warm2", "gamma");   // written after the batch read; must not affect the snapshot
+
+		assertThat(ivs.keySet()).containsExactly("warm", "cold", "warm2").inOrder();
+		assertThat(ivs.get("warm").getValue()).isEqualTo("alpha");
+		assertThat(ivs.get("cold").getValue()).isNull();     // bootstrapped sentinel
+		assertThat(ivs.get("warm2").getValue()).isNull();    // bootstrapped sentinel
+
+		// Every snapshot in the batch is still a usable CAS basis; only "warm2" was stomped.
+		final Map<String, CasPut> proposed = new LinkedHashMap<>();
+		proposed.put("warm", new CasPut(ivs.get("warm"), "fresh-warm", 0));
+		proposed.put("cold", new CasPut(ivs.get("cold"), "fresh-cold", 0));
+		proposed.put("warm2", new CasPut(ivs.get("warm2"), "fresh-warm2", 0));
+
+		assertThat(cache.putIfUntouched(proposed)).containsExactly("warm", "cold");
+		assertThat(cache.get("warm")).isEqualTo("fresh-warm");
+		assertThat(cache.get("cold")).isEqualTo("fresh-cold");
+		assertThat(cache.get("warm2")).isEqualTo("gamma");
+	}
+
+	@Test
+	void getIdentifiablesOnEmptyBatchReturnsEmpty() {
+		assertThat(cache.getIdentifiables(Arrays.asList())).isEmpty();
+	}
+
+	@Test
 	void casSucceedsOnUntouchedSentinel() {
 		final IdentifiableValue iv = cache.getIdentifiables(Arrays.asList("k")).get("k");
 
